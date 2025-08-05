@@ -1,0 +1,459 @@
+#!/usr/bin/env python3
+# Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved.
+
+import json
+import logging
+import math
+import numpy as np
+import os
+from datetime import datetime
+import psutil
+import torch
+from fvcore.nn.activation_count import activation_count
+from fvcore.nn.flop_count import flop_count
+from matplotlib import pyplot as plt
+import time
+from torch import nn
+
+import trokens.utils.logging as logging
+import trokens.utils.multiprocessing as mpu
+from trokens.datasets.utils import pack_pathway_output
+from trokens.models.batchnorm_helper import SubBatchNorm3d
+from trokens.utils.env import pathmgr
+
+logger = logging.get_logger(__name__)
+
+
+def check_nan_losses(loss):
+    """
+    Determine whether the loss is NaN (not a number).
+    Args:
+        loss (loss): loss to check whether is NaN.
+    """
+    if math.isnan(loss):
+        raise RuntimeError("ERROR: Got NaN losses {}".format(datetime.now()))
+
+
+def params_count(model, ignore_bn=False):
+    """
+    Compute the number of parameters.
+    Args:
+        model (model): model to count the number of parameters.
+    Returns:
+        total_params (int): total number of parameters
+        trainable_params (int): number of trainable parameters
+    """
+    if not ignore_bn:
+        total_params = np.sum([p.numel() for p in model.parameters()]).item()
+        trainable_params = np.sum([p.numel() for p in model.parameters() if p.requires_grad]).item()
+        return total_params, trainable_params
+    else:
+        total_count = 0
+        trainable_count = 0
+        for m in model.modules():
+            if not isinstance(m, nn.BatchNorm3d):
+                for p in m.parameters(recurse=False):
+                    total_count += p.numel()
+                    if p.requires_grad:
+                        trainable_count += p.numel()
+        return total_count, trainable_count
+
+
+def gpu_mem_usage():
+    """
+    Compute the GPU memory usage for the current device (GB).
+    """
+    if torch.cuda.is_available():
+        mem_usage_bytes = torch.cuda.max_memory_allocated()
+    else:
+        mem_usage_bytes = 0
+    return mem_usage_bytes / 1024 ** 3
+
+
+def cpu_mem_usage():
+    """
+    Compute the system memory (RAM) usage for the current device (GB).
+    Returns:
+        usage (float): used memory (GB).
+        total (float): total memory (GB).
+    """
+    vram = psutil.virtual_memory()
+    usage = (vram.total - vram.available) / 1024 ** 3
+    total = vram.total / 1024 ** 3
+
+    return usage, total
+
+
+def _get_model_analysis_input(cfg, use_train_input):
+    """
+    Return a dummy input for model analysis with batch size 1. The input is
+        used for analyzing the model (counting flops and activations etc.).
+    Args:
+        cfg (CfgNode): configs. Details can be found in
+            trokens/config/defaults.py
+        use_train_input (bool): if True, return the input for training. Otherwise,
+            return the input for testing.
+
+    Returns:
+        inputs: the input for model analysis.
+    """
+    rgb_dimension = 3
+    if use_train_input:
+        if cfg.TRAIN.DATASET in ["imagenet", "imagenetprefetch"]:
+            input_tensors = torch.rand(
+                rgb_dimension,
+                cfg.DATA.TRAIN_CROP_SIZE,
+                cfg.DATA.TRAIN_CROP_SIZE,
+            )
+        else:
+            input_tensors = torch.rand(
+                rgb_dimension,
+                cfg.DATA.NUM_FRAMES,
+                cfg.DATA.TRAIN_CROP_SIZE,
+                cfg.DATA.TRAIN_CROP_SIZE,
+            )
+    else:
+        if cfg.TEST.DATASET in ["imagenet", "imagenetprefetch"]:
+            input_tensors = torch.rand(
+                rgb_dimension,
+                cfg.DATA.TEST_CROP_SIZE,
+                cfg.DATA.TEST_CROP_SIZE,
+            )
+        else:
+            input_tensors = torch.rand(
+                rgb_dimension,
+                cfg.DATA.NUM_FRAMES,
+                cfg.DATA.TEST_CROP_SIZE,
+                cfg.DATA.TEST_CROP_SIZE,
+            )
+    model_inputs = pack_pathway_output(cfg, input_tensors)
+    for i in range(len(model_inputs)):
+        model_inputs[i] = model_inputs[i].unsqueeze(0)
+        if cfg.NUM_GPUS:
+            model_inputs[i] = model_inputs[i].cuda(non_blocking=True)
+
+    # If detection is enabled, count flops for one proposal.
+    bbox = torch.tensor([[0, 0, 1.0, 0, 1.0]])
+    if cfg.NUM_GPUS:
+        bbox = bbox.cuda()
+    md = {'orvit_bboxes': bbox[:, -4:].reshape(1, 1,1,4).expand(1,cfg.DATA.NUM_FRAMES,cfg.ORVIT.O,4)}
+    if cfg.DETECTION.ENABLE:
+        inputs = (model_inputs, md, bbox)
+    else:
+        inputs = (model_inputs, md)
+    return inputs
+
+def get_input_for_flop_calc(cfg, loader, batch_size=1, device='cuda', skip_feat_extractor=False):
+    video, _, _, metadata = loader.dataset.__getitem__((0,0,0))
+
+    video = video.to(device).unsqueeze(0).repeat(batch_size,1,1,1,1)
+    keep_keys = ['pred_tracks', 'pred_visibility', 'pred_query_mask', 'hod_feat']
+    new_metadata = {}
+    for key, value in metadata.items():
+        if key in keep_keys:
+            if isinstance(value, torch.Tensor):
+                new_metadata[key] = torch.stack([metadata[key]]*batch_size, dim=0).to(device)
+            else:
+                # concert to torch tensor and add batch dimension
+                new_metadata[key] = torch.tensor(value).unsqueeze(0).repeat(batch_size,1, 1).to(device)
+
+    input_to_use = {'video': video, 'metadata': new_metadata}
+    if skip_feat_extractor:
+        input_to_use['skip_feat_extractor'] = True
+    return input_to_use
+
+
+
+def get_model_stats(model, cfg, mode, loader, skip_feat_extractor=False):
+    """
+    Compute statistics for the current model given the config.
+    Args:
+        model (model): model to perform analysis.
+        cfg (CfgNode): configs. Details can be found in
+            trokens/config/defaults.py
+        mode (str): Options include `flop` or `activation`. Compute either flop
+            (gflops) or activation count (mega).
+        loader (DataLoader): loader to get the input for the model.
+
+    Returns:
+        float: the total number of count of the given model.
+    """
+    assert mode in [
+        "flop",
+        "activation",
+    ], "'{}' not supported for model analysis".format(mode)
+    if mode == "flop":
+        model_stats_fun = flop_count
+    elif mode == "activation":
+        model_stats_fun = activation_count
+
+    # Set model to evaluation mode for analysis.
+    # Evaluation mode can avoid getting stuck with sync batchnorm.
+    model_mode = model.training
+    model.eval()
+    inputs = get_input_for_flop_calc(cfg, loader, batch_size=1, skip_feat_extractor=skip_feat_extractor)
+    count_dict, *_ = model_stats_fun(model, inputs)
+    start_time = time.time()
+    check = model(inputs)
+    end_time = time.time()
+    time_taken = end_time - start_time
+    count = sum(count_dict.values())
+    model.train(model_mode)
+    return count, time_taken
+
+
+def log_model_info(model, cfg, loader):
+    """
+    Log info, includes number of parameters, gpu usage, gflops and activation count.
+        The model info is computed when the model is in validation mode.
+    Args:
+        model (model): model to log the info.
+        cfg (CfgNode): configs. Details can be found in
+            trokens/config/defaults.py
+        loader (DataLoader): loader to get the input for the model.
+    """
+    logger.info("Model:\n{}".format(model))
+    total_params, trainable_params = params_count(model)
+    logger.info("Params: {:,}".format(total_params))
+    logger.info("Trainable Params: {:,}".format(trainable_params))
+    logger.info("Mem: {:,} MB".format(gpu_mem_usage()))
+    total_flops, time_taken = get_model_stats(model, cfg, "flop", loader)
+    logger.info(
+        "Flops: {:,} G, Time taken: {:0.2f}s".format(
+            total_flops, time_taken
+        )
+    )
+    flop_skip_feat_extractor, time_taken_skip_feat_extractor = get_model_stats(
+        model, cfg, "flop", loader, skip_feat_extractor=True)
+    logger.info(
+        "Flops (skip feat extractor): {:,} G, Time taken: {:0.5f}s".format(
+            flop_skip_feat_extractor, time_taken_skip_feat_extractor
+        ))
+
+    logger.info(
+        "Activations: {:,} M".format(
+            get_model_stats(model, cfg, "activation", loader)[0]
+        )
+    )
+    logger.info("nvidia-smi")
+    os.system("nvidia-smi")
+    return_dict = {
+        'total_flops': total_flops,
+        'flops_no_feat_extractor': flop_skip_feat_extractor,
+        'total_params': total_params,
+        'trainable_params': trainable_params,
+    }
+    return return_dict
+
+
+def is_eval_epoch(cfg, cur_epoch, multigrid_schedule):
+    """
+    Determine if the model should be evaluated at the current epoch.
+    Args:
+        cfg (CfgNode): configs. Details can be found in
+            trokens/config/defaults.py
+        cur_epoch (int): current epoch.
+        multigrid_schedule (List): schedule for multigrid training.
+    """
+    if cfg.TRAIN.VAL_ONLY:
+        return True
+    if cur_epoch + 1 == cfg.SOLVER.MAX_EPOCH:
+        return True
+    if multigrid_schedule is not None:
+        prev_epoch = 0
+        for s in multigrid_schedule:
+            if cur_epoch < s[-1]:
+                period = max(
+                    (s[-1] - prev_epoch) // cfg.MULTIGRID.EVAL_FREQ + 1, 1
+                )
+                return (s[-1] - 1 - cur_epoch) % period == 0
+            prev_epoch = s[-1]
+
+    return ((cur_epoch + 1) % cfg.TRAIN.EVAL_PERIOD == 0) or cfg.TRAIN.VAL_ONLY
+
+
+def plot_input(tensor, bboxes=(), texts=(), path="./tmp_vis.png"):
+    """
+    Plot the input tensor with the optional bounding box and save it to disk.
+    Args:
+        tensor (tensor): a tensor with shape of `NxCxHxW`.
+        bboxes (tuple): bounding boxes with format of [[x, y, h, w]].
+        texts (tuple): a tuple of string to plot.
+        path (str): path to the image to save to.
+    """
+    tensor = tensor.float()
+    tensor = tensor - tensor.min()
+    tensor = tensor / tensor.max()
+    f, ax = plt.subplots(nrows=1, ncols=tensor.shape[0], figsize=(50, 20))
+    for i in range(tensor.shape[0]):
+        ax[i].axis("off")
+        ax[i].imshow(tensor[i].permute(1, 2, 0))
+        # ax[1][0].axis('off')
+        if bboxes is not None and len(bboxes) > i:
+            for box in bboxes[i]:
+                x1, y1, x2, y2 = box
+                ax[i].vlines(x1, y1, y2, colors="g", linestyles="solid")
+                ax[i].vlines(x2, y1, y2, colors="g", linestyles="solid")
+                ax[i].hlines(y1, x1, x2, colors="g", linestyles="solid")
+                ax[i].hlines(y2, x1, x2, colors="g", linestyles="solid")
+
+        if texts is not None and len(texts) > i:
+            ax[i].text(0, 0, texts[i])
+    f.savefig(path)
+
+
+def frozen_bn_stats(model):
+    """
+    Set all the bn layers to eval mode.
+    Args:
+        model (model): model to set bn layers to eval mode.
+    """
+    for m in model.modules():
+        if isinstance(m, nn.BatchNorm3d):
+            m.eval()
+
+
+def aggregate_sub_bn_stats(module):
+    """
+    Recursively find all SubBN modules and aggregate sub-BN stats.
+    Args:
+        module (nn.Module)
+    Returns:
+        count (int): number of SubBN module found.
+    """
+    count = 0
+    for child in module.children():
+        if isinstance(child, SubBatchNorm3d):
+            child.aggregate_stats()
+            count += 1
+        else:
+            count += aggregate_sub_bn_stats(child)
+    return count
+
+
+def launch_job(cfg, init_method, func, daemon=False, new_dist_init=False, args=None, wandb_run=None):
+    """
+    Run 'func' on one or more GPUs, specified in cfg
+    Args:
+        cfg (CfgNode): configs. Details can be found in
+            trokens/config/defaults.py
+        init_method (str): initialization method to launch the job with multiple
+            devices.
+        func (function): job to run on GPU(s)
+        daemon (bool): The spawned processes' daemon flag. If set to True,
+            daemonic processes will be created
+    """
+    return func(cfg=cfg, args=args, wandb_run=wandb_run)
+
+
+
+def get_class_names(path, parent_path=None, subset_path=None):
+    """
+    Read json file with entries {classname: index} and return
+    an array of class names in order.
+    If parent_path is provided, load and map all children to their ids.
+    Args:
+        path (str): path to class ids json file.
+            File must be in the format {"class1": id1, "class2": id2, ...}
+        parent_path (Optional[str]): path to parent-child json file.
+            File must be in the format {"parent1": ["child1", "child2", ...], ...}
+        subset_path (Optional[str]): path to text file containing a subset
+            of class names, separated by newline characters.
+    Returns:
+        class_names (list of strs): list of class names.
+        class_parents (dict): a dictionary where key is the name of the parent class
+            and value is a list of ids of the children classes.
+        subset_ids (list of ints): list of ids of the classes provided in the
+            subset file.
+    """
+    try:
+        with pathmgr.open(path, "r") as f:
+            class2idx = json.load(f)
+    except Exception as err:
+        print("Fail to load file from {} with error {}".format(path, err))
+        return
+
+    max_key = max(class2idx.values())
+    class_names = [None] * (max_key + 1)
+
+    for k, i in class2idx.items():
+        class_names[i] = k
+
+    class_parent = None
+    if parent_path is not None and parent_path != "":
+        try:
+            with pathmgr.open(parent_path, "r") as f:
+                d_parent = json.load(f)
+        except EnvironmentError as err:
+            print(
+                "Fail to load file from {} with error {}".format(
+                    parent_path, err
+                )
+            )
+            return
+        class_parent = {}
+        for parent, children in d_parent.items():
+            indices = [
+                class2idx[c] for c in children if class2idx.get(c) is not None
+            ]
+            class_parent[parent] = indices
+
+    subset_ids = None
+    if subset_path is not None and subset_path != "":
+        try:
+            with pathmgr.open(subset_path, "r") as f:
+                subset = f.read().split("\n")
+                subset_ids = [
+                    class2idx[name]
+                    for name in subset
+                    if class2idx.get(name) is not None
+                ]
+        except EnvironmentError as err:
+            print(
+                "Fail to load file from {} with error {}".format(
+                    subset_path, err
+                )
+            )
+            return
+
+    return class_names, class_parent, subset_ids
+
+
+def iter_to_cuda(d):
+    iter = []
+    if isinstance(d, torch.Tensor):
+        return d.cuda(non_blocking=True)
+    elif isinstance(d, dict):
+        iter = d.items( )
+    elif isinstance(d, list):
+        iter = enumerate(d)
+    for k,v in iter:
+        d[k] = iter_to_cuda(v)
+    return d
+
+def iter_to_cpu(d):
+    iter = []
+    if isinstance(d, torch.Tensor):
+        return d.cpu()
+    elif isinstance(d, dict):
+        iter = d.items( )
+    elif isinstance(d, list):
+        iter = enumerate(d)
+    for k,v in iter:
+        d[k] = iter_to_cpu(v)
+    return d
+
+def get_time_str():
+    now = datetime.now()
+    dt_string = now.strftime("%d_%m_%Y_%H_%M_%S")
+    return dt_string
+
+def get_num_classes(cfg):
+    if cfg.TRAIN.DATASET == 'epickitchens':
+        return {'noun': 300, 'verb': 97}
+    else:
+        return cfg.MODEL.NUM_CLASSES
+
+def module_0_init(net):
+    for name, W in net.named_parameters():
+        nn.init.zeros_(W)

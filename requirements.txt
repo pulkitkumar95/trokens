@@ -1,0 +1,16 @@
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch
+torchvision
+torchaudio
+pandas
+einops
+iopath
+wandb
+simplejson
+decord
+matplotlib
+opencv-python
+imageio
+scikit-learn
+fvcore
+psutil
