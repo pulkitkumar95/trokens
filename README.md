@@ -7,8 +7,8 @@
 **ICCV 2025** <br>
 <sup>*Equal contribution</sup>
 
-<a href="https://trokens-iccv25.github.io/'"><img src='https://img.shields.io/badge/arXiv-Trokens-red' alt='Paper PDF'></a>
-<a href='https://www.cs.umd.edu/~pulkit/trokens/'><img src='https://img.shields.io/badge/Project_Page-Trokens-green' alt='Project Page'></a>
+<a href='https://arxiv.org/abs/2508.03695'><img src='https://img.shields.io/badge/arXiv-Trokens-red' alt='Paper PDF'></a>
+<a href='https://trokens-iccv25.github.io'><img src='https://img.shields.io/badge/Project_Page-Trokens-green' alt='Project Page'></a>
 <a href='https://huggingface.co/datasets/pulkitkumar95/trokens_pt_data'><img src='https://img.shields.io/badge/Hugging_Face-Data-blue' alt='Hugging Face'></a>
 
 <!-- <p float='center'><img src="assets/teaser.png" width="80%" /></p>
